@@ -365,20 +365,18 @@ func (d *Driver) Start(ctx context.Context) error {
 	return nil
 }
 
-func (d *Driver) isKeyExpired(_ context.Context, createTime time.Time, value *JSValue) bool {
-
-	requestTime := time.Now()
-	expired := false
+func (d *Driver) isKeyExpired(_ context.Context, entry nats.KeyValueEntry, value *JSValue) bool {
 	if value.KV.Lease > 0 {
-		if requestTime.After(createTime.Add(time.Second * time.Duration(value.KV.Lease))) {
-			expired = true
-			if err := d.kv.Delete(value.KV.Key); err != nil {
+		if time.Now().Before(entry.Created().Add(time.Second * time.Duration(value.KV.Lease))) {
+			return false
+		}
+		if err := d.kv.Delete(value.KV.Key, nats.LastRevision(entry.Revision())); err != nil {
 				logrus.Warnf("problem deleting expired key=%s, error=%v", value.KV.Key, err)
 			}
-		}
+		return true
 	}
 
-	return expired
+	return false
 }
 
 // Get returns the associated server.KeyValue
@@ -433,7 +431,7 @@ func (d *Driver) get(ctx context.Context, key string, revision int64, includeDel
 				return 0, nil, nats.ErrKeyNotFound
 			}
 
-			if d.isKeyExpired(ctx, entry.Created(), &val) {
+			if d.isKeyExpired(ctx, entry, &val) {
 				return 0, nil, nats.ErrKeyNotFound
 			}
 			return val.KV.ModRevision, &val, nil
@@ -459,7 +457,7 @@ func (d *Driver) get(ctx context.Context, key string, revision int64, includeDel
 			return 0, nil, nats.ErrKeyNotFound
 		}
 
-		if d.isKeyExpired(ctx, entry.Created(), &val) {
+		if d.isKeyExpired(ctx, entry, &val) {
 			return 0, nil, nats.ErrKeyNotFound
 		}
 		return val.KV.ModRevision, &val, nil
