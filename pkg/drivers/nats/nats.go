@@ -3,6 +3,7 @@ package nats
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -635,48 +636,59 @@ func (d *Driver) List(ctx context.Context, prefix, startKey string, limit, revis
 			requestTime.After(createTime.Add(time.Second*time.Duration(kv.Lease)))
 	}
 	var kvs []*server.KeyValue
-	for e := range watcher.Updates() {
-		if e == nil {
-			break
-		}
-		if revision > 0 && int64(e.Revision()) > revision {
-			break
-		}
-		if startKey != "" && e.Key() < startKey {
-			continue
-		}
-		i := sort.Search(len(kvs), func(i int) bool {
-			return kvs[i].Key >= e.Key()
-		})
-		if e.Operation() == nats.KeyValueDelete {
-			if i < len(kvs) && kvs[i].Key == e.Key() {
-				kvs = append(kvs[:i], kvs[i+1:]...)
+ListValues:
+	for {
+		select {
+		case e, ok := <-watcher.Updates():
+			if !ok {
+				logrus.Warnf("list: %s channel closed", prefix)
+				return rev, nil, errors.New("channel closed")
+			}
+			if e == nil {
+				break ListValues
+			}
+			if revision > 0 && int64(e.Revision()) > revision {
+				break ListValues
+			}
+			if startKey != "" && e.Key() < startKey {
+				continue
+			}
+			i := sort.Search(len(kvs), func(i int) bool {
+				return kvs[i].Key >= e.Key()
+			})
+			if e.Operation() == nats.KeyValueDelete {
+				if i < len(kvs) && kvs[i].Key == e.Key() {
+					kvs = append(kvs[:i], kvs[i+1:]...)
+				}
+				delete(expiredKeys, e.Key())
+				continue
+			}
+			kv, err := decode(e)
+			if err != nil {
+				logrus.Warnf("could not decode %s rev=> %d: %s", e.Key(), e.Revision(), err)
+				continue
+			}
+			if isExpired(e.Created(), kv.KV) {
+				if i < len(kvs) && kvs[i].Key == e.Key() {
+					kvs = append(kvs[:i], kvs[i+1:]...)
+				}
+				expiredKeys[e.Key()] = struct{}{}
+				continue
 			}
 			delete(expiredKeys, e.Key())
-			continue
-		}
-		kv, err := decode(e)
-		if err != nil {
-			logrus.Warnf("Could not decode %s rev=> %d: %s", e.Key(), e.Revision(), err)
-			continue
-		}
-		if isExpired(e.Created(), kv.KV) {
-			if i < len(kvs) && kvs[i].Key == e.Key() {
-				kvs = append(kvs[:i], kvs[i+1:]...)
+			if i == len(kvs) {
+				kvs = append(kvs, kv.KV)
+			} else if kvs[i].Key == e.Key() {
+				kvs[i] = kv.KV
+			} else {
+				kvs = append(kvs[:i], append([]*server.KeyValue{kv.KV}, kvs[i:]...)...)
 			}
-			expiredKeys[e.Key()] = struct{}{}
-			continue
-		}
-		delete(expiredKeys, e.Key())
-		if i == len(kvs) {
-			kvs = append(kvs, kv.KV)
-		} else if kvs[i].Key == e.Key() {
-			kvs[i] = kv.KV
-		} else {
-			kvs = append(kvs[:i], append([]*server.KeyValue{kv.KV}, kvs[i:]...)...)
-		}
-		if limit > 0 && len(kvs) > int(limit) {
-			kvs = kvs[:limit]
+			if limit > 0 && len(kvs) > int(limit) {
+				kvs = kvs[:limit]
+			}
+		case <-ctx.Done():
+			logrus.Warnf("list: %s context cancelled", prefix)
+			return rev, nil, ctx.Err()
 		}
 	}
 	for key := range expiredKeys {
