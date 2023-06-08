@@ -601,125 +601,88 @@ func (d *Driver) List(ctx context.Context, prefix, startKey string, limit, revis
 	if err != nil {
 		return 0, nil, err
 	}
-
-	kvs := make([]*server.KeyValue, 0)
-	var count int64
-
-	// startkey provided so get max revision after the startKey matching the prefix
-	if startKey != "" {
-		histories := make(map[string][]nats.KeyValueEntry)
-		var minRev int64
-		//var innerEntry nats.KeyValueEntry
-		if entries, err := d.kv.History(startKey, nats.Context(ctx)); err == nil {
-			histories[startKey] = entries
-			for i := len(entries) - 1; i >= 0; i-- {
-				// find the matching startKey
-				if int64(entries[i].Revision()) <= revision {
-					minRev = int64(entries[i].Revision())
-					logrus.Debugf("Found min revision=%d for key=%s", minRev, startKey)
-					break
-				}
-			}
-		} else {
-			return 0, nil, err
-		}
-
-		keys, err := d.getKeys(ctx, prefix, true)
+	if revision > 0 {
+		compactRev, err := d.compactRevision()
 		if err != nil {
-			return 0, nil, err
+			return rev, nil, err
 		}
-
-		for _, key := range keys {
-			if key != startKey {
-				if history, err := d.kv.History(key, nats.Context(ctx)); err == nil {
-					histories[key] = history
-				} else {
-					// should not happen
-					logrus.Warnf("no history for %s", key)
-				}
-			}
+		if revision < compactRev {
+			return rev, nil, server.ErrCompacted
 		}
-		var nextRevID = minRev
-		var nextRevision nats.KeyValueEntry
-		for k, v := range histories {
-			logrus.Debugf("Checking %s history", k)
-			for i := len(v) - 1; i >= 0; i-- {
-				if int64(v[i].Revision()) > nextRevID && int64(v[i].Revision()) <= revision {
-					nextRevID = int64(v[i].Revision())
-					nextRevision = v[i]
-					logrus.Debugf("found next rev=%d", nextRevID)
-					break
-				} else if int64(v[i].Revision()) <= nextRevID {
-					break
-				}
-			}
-		}
-		if nextRevision != nil {
-			entry, err := decode(nextRevision)
-			if err != nil {
-				return 0, nil, err
-			}
-			kvs = append(kvs, entry.KV)
-		}
-
-		return rev, kvs, nil
 	}
-
-	current := true
-
-	if revision != 0 {
-		rev = revision
-		current = false
+	opts := []nats.WatchOpt{
+		nats.Context(ctx),
 	}
-
-	if current {
-
-		entries, err := d.getKeyValues(ctx, prefix, true)
-		if err != nil {
-			return 0, nil, err
-		}
-		for _, e := range entries {
-			if count < limit || limit == 0 {
-				kv, err := decode(e)
-				if !d.isKeyExpired(ctx, e.Created(), &kv) && err == nil {
-					kvs = append(kvs, kv.KV)
-					count++
-				}
-			} else {
-				break
-			}
-		}
-
+	if revision > 0 {
+		opts = append(opts, nats.IncludeHistory())
 	} else {
-		keys, err := d.getKeys(ctx, prefix, true)
+		opts = append(opts, nats.IgnoreDeletes())
+	}
+	watcher, err := d.kv.Watch(prefix, opts...)
+	if err != nil {
+		return rev, nil, err
+	}
+	defer func() {
+		err := watcher.Stop()
 		if err != nil {
-			return 0, nil, err
+			logrus.Warnf("failed to stop %s listEntries watcher", prefix)
 		}
-		if revision == 0 && len(keys) == 0 {
-			return rev, nil, nil
+	}()
+	requestTime := time.Now()
+	expiredKeys := make(map[string]struct{})
+	isExpired := func(createTime time.Time, kv *server.KeyValue) bool {
+		return kv.Lease > 0 &&
+			requestTime.After(createTime.Add(time.Second*time.Duration(kv.Lease)))
+	}
+	var kvs []*server.KeyValue
+	for e := range watcher.Updates() {
+		if e == nil {
+			break
 		}
-
-		for _, key := range keys {
-			if count < limit || limit == 0 {
-				if history, err := d.kv.History(key, nats.Context(ctx)); err == nil {
-					for i := len(history) - 1; i >= 0; i-- {
-						if int64(history[i].Revision()) <= revision {
-							if entry, err := decode(history[i]); err == nil {
-								kvs = append(kvs, entry.KV)
-								count++
-							} else {
-								logrus.Warnf("Could not decode %s rev=> %d", key, history[i].Revision())
-							}
-							break
-						}
-					}
-				} else {
-					// should not happen
-					logrus.Warnf("no history for %s", key)
-				}
+		if revision > 0 && int64(e.Revision()) > revision {
+			break
+		}
+		if startKey != "" && e.Key() < startKey {
+			continue
+		}
+		i := sort.Search(len(kvs), func(i int) bool {
+			return kvs[i].Key >= e.Key()
+		})
+		if e.Operation() == nats.KeyValueDelete {
+			if i < len(kvs) && kvs[i].Key == e.Key() {
+				kvs = append(kvs[:i], kvs[i+1:]...)
 			}
+			delete(expiredKeys, e.Key())
+			continue
 		}
-
+		kv, err := decode(e)
+		if err != nil {
+			logrus.Warnf("Could not decode %s rev=> %d: %s", e.Key(), e.Revision(), err)
+			continue
+		}
+		if isExpired(e.Created(), kv.KV) {
+			if i < len(kvs) && kvs[i].Key == e.Key() {
+				kvs = append(kvs[:i], kvs[i+1:]...)
+			}
+			expiredKeys[e.Key()] = struct{}{}
+			continue
+		}
+		delete(expiredKeys, e.Key())
+		if i == len(kvs) {
+			kvs = append(kvs, kv.KV)
+		} else if kvs[i].Key == e.Key() {
+			kvs[i] = kv.KV
+		} else {
+			kvs = append(kvs[:i], append([]*server.KeyValue{kv.KV}, kvs[i:]...)...)
+		}
+		if limit > 0 && len(kvs) > int(limit) {
+			kvs = kvs[:limit]
+		}
+	}
+	for key := range expiredKeys {
+		if err := d.kv.Delete(key); err != nil {
+			logrus.Warnf("problem deleting expired key=%s, error=%v", key, err)
+		}
 	}
 	return rev, kvs, nil
 }
