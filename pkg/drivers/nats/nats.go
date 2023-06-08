@@ -568,12 +568,12 @@ func (d *Driver) Delete(ctx context.Context, key string, revision int64) (revRet
 		return rev, nil, false, err
 	}
 
-	deleteRev, err := d.kv.Put(key, deleteEventBytes)
+	deleteRev, err := d.kv.Update(key, deleteEventBytes, uint64(revision))
 	if err != nil {
 		return rev, value.KV, false, nil
 	}
 
-	err = d.kv.Delete(key)
+	err = d.kv.Delete(key, nats.LastRevision(deleteRev))
 	if err != nil {
 		return rev, value.KV, false, nil
 	}
