@@ -371,8 +371,8 @@ func (d *Driver) isKeyExpired(_ context.Context, entry nats.KeyValueEntry, value
 			return false
 		}
 		if err := d.kv.Delete(value.KV.Key, nats.LastRevision(entry.Revision())); err != nil {
-				logrus.Warnf("problem deleting expired key=%s, error=%v", value.KV.Key, err)
-			}
+			logrus.Warnf("problem deleting expired key=%s, error=%v", value.KV.Key, err)
+		}
 		return true
 	}
 
@@ -605,17 +605,16 @@ func (d *Driver) List(ctx context.Context, prefix, startKey string, limit, revis
 		if err != nil {
 			return rev, nil, err
 		}
-		if revision < compactRev {
+		if compactRev > revision {
 			return rev, nil, server.ErrCompacted
 		}
 	}
 	opts := []nats.WatchOpt{
 		nats.Context(ctx),
+		nats.IgnoreDeletes(),
 	}
 	if revision > 0 {
 		opts = append(opts, nats.IncludeHistory())
-	} else {
-		opts = append(opts, nats.IgnoreDeletes())
 	}
 	watcher, err := d.kv.Watch(prefix, opts...)
 	if err != nil {
@@ -627,74 +626,75 @@ func (d *Driver) List(ctx context.Context, prefix, startKey string, limit, revis
 			logrus.Warnf("failed to stop %s listEntries watcher", prefix)
 		}
 	}()
-	requestTime := time.Now()
-	expiredKeys := make(map[string]struct{})
-	isExpired := func(createTime time.Time, kv *server.KeyValue) bool {
-		return kv.Lease > 0 &&
-			requestTime.After(createTime.Add(time.Second*time.Duration(kv.Lease)))
-	}
 	var kvs []*server.KeyValue
-ListValues:
-	for {
-		select {
-		case e, ok := <-watcher.Updates():
-			if !ok {
-				logrus.Warnf("list: %s channel closed", prefix)
-				return rev, nil, errors.New("channel closed")
-			}
-			if e == nil {
-				break ListValues
-			}
-			if revision > 0 && int64(e.Revision()) > revision {
-				break ListValues
-			}
-			if startKey != "" && e.Key() < startKey {
-				continue
-			}
-			i := sort.Search(len(kvs), func(i int) bool {
-				return kvs[i].Key >= e.Key()
-			})
-			if e.Operation() == nats.KeyValueDelete {
-				if i < len(kvs) && kvs[i].Key == e.Key() {
-					kvs = append(kvs[:i], kvs[i+1:]...)
-				}
-				delete(expiredKeys, e.Key())
-				continue
-			}
-			kv, err := decode(e)
-			if err != nil {
-				logrus.Warnf("could not decode %s rev=> %d: %s", e.Key(), e.Revision(), err)
-				continue
-			}
-			if isExpired(e.Created(), kv.KV) {
-				if i < len(kvs) && kvs[i].Key == e.Key() {
-					kvs = append(kvs[:i], kvs[i+1:]...)
-				}
-				expiredKeys[e.Key()] = struct{}{}
-				continue
-			}
-			delete(expiredKeys, e.Key())
-			if i == len(kvs) {
-				kvs = append(kvs, kv.KV)
-			} else if kvs[i].Key == e.Key() {
-				kvs[i] = kv.KV
-			} else {
-				kvs = append(kvs[:i], append([]*server.KeyValue{kv.KV}, kvs[i:]...)...)
-			}
-			if limit > 0 && len(kvs) > int(limit) {
-				kvs = kvs[:limit]
-			}
-		case <-ctx.Done():
-			logrus.Warnf("list: %s context cancelled", prefix)
-			return rev, nil, ctx.Err()
+	if ok, err := recvWhile(ctx, watcher.Updates(), func(e nats.KeyValueEntry) bool {
+		if e == nil {
+			return false
 		}
-	}
-	for key := range expiredKeys {
-		if err := d.kv.Delete(key); err != nil {
-			logrus.Warnf("problem deleting expired key=%s, error=%v", key, err)
+		if revision > 0 && int64(e.Revision()) > revision {
+			return false
 		}
+		if startKey != "" && e.Key() < startKey {
+			return true
+		}
+		value, err := decode(e)
+		if err != nil {
+			logrus.Warnf("could not decode %s rev=> %d: %s", e.Key(), e.Revision(), err)
+			return true
+		}
+		atIndex := sort.Search(len(kvs), func(i int) bool {
+			return kvs[i].Key >= value.KV.Key
+		})
+		exists := atIndex < len(kvs) && kvs[atIndex].Key == value.KV.Key
+		if value.Delete {
+			if exists {
+				kvs = append(kvs[:atIndex], kvs[atIndex+1:]...)
+			}
+			return true
+		}
+		if d.isKeyExpired(ctx, e, &value) {
+			if exists {
+				kvs = append(kvs[:atIndex], kvs[atIndex+1:]...)
+			}
+			return true
+		}
+		if exists {
+			kvs[atIndex] = value.KV
+		} else if atIndex < len(kvs) {
+			kvs = append(kvs[:atIndex], append([]*server.KeyValue{value.KV}, kvs[atIndex:]...)...)
+		} else {
+			kvs = append(kvs, value.KV)
+		}
+		if limit > 0 && len(kvs) > int(limit) {
+			kvs = kvs[:limit]
+		}
+		return true
+	}); err != nil {
+		logrus.Warnf("list: %s context cancelled", prefix)
+		return rev, nil, err
+	} else if !ok {
+		logrus.Warnf("list: %s channel closed", prefix)
+		return rev, nil, errors.New("channel closed")
 	}
 	return rev, kvs, nil
+}
+
+type condFn func(nats.KeyValueEntry) (more bool)
+
+func recvWhile(ctx context.Context, ch <-chan nats.KeyValueEntry, fn condFn) (bool, error) {
+	for {
+		select {
+		case e, ok := <-ch:
+			if !ok {
+				return false, nil
+			}
+			if !fn(e) {
+				return true, nil
+			}
+		case <-ctx.Done():
+			return true, ctx.Err()
+		}
+	}
 }
 
 func (d *Driver) listAfter(ctx context.Context, prefix string, revision int64) (revRet int64, eventRet []*server.Event, errRet error) {
