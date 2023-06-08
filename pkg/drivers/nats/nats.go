@@ -817,79 +817,142 @@ func (d *Driver) Update(ctx context.Context, key string, value []byte, revision,
 }
 
 func (d *Driver) Watch(ctx context.Context, prefix string, revision int64) <-chan []*server.Event {
-
-	watcher, err := d.kv.(*kv.EncodedKV).Watch(prefix, nats.IgnoreDeletes(), nats.Context(ctx))
-
-	if revision > 0 {
-		revision--
+	opts := []nats.WatchOpt{
+		nats.Context(ctx),
+		nats.IgnoreDeletes(),
 	}
-	_, events, err := d.listAfter(ctx, prefix, revision)
-
-	if err != nil {
-		logrus.Errorf("failed to create watcher %s for revision %d", prefix, revision)
+	if revision > 0 {
+		opts = append(opts, nats.IncludeHistory())
 	}
 
 	result := make(chan []*server.Event, 100)
-
+	watcher, err := d.kv.Watch(prefix, opts...)
+	if err != nil {
+		logrus.Errorf("failed to create watcher %s for revision %d", prefix, revision)
+		close(result)
+		return result
+	}
 	go func() {
-
-		if len(events) > 0 {
-			result <- events
-			revision = events[len(events)-1].KV.ModRevision
+		defer func() {
+			if err := watcher.Stop(); err != nil && err != nats.ErrBadSubscription {
+				logrus.Warnf("error stopping %s watcher: %v", prefix, err)
+			}
+			close(result)
+		}()
+		sendSyntheticEvents := revision <= 0
+		type entry struct {
+			currEntry, prevEntry nats.KeyValueEntry
 		}
-
-		for {
-			select {
-			case i := <-watcher.Updates():
-				if i != nil {
-					if int64(i.Revision()) > revision {
-						events := make([]*server.Event, 1)
-						var err error
-						value := JSValue{
-							KV:           &server.KeyValue{},
-							PrevRevision: 0,
-							Create:       false,
-							Delete:       false,
+		batch := make(map[string]entry)
+		flushBatch := func() error {
+			if len(batch) == 0 {
+				if sendSyntheticEvents {
+					sendSyntheticEvents = false
+					result <- nil
+				}
+				return nil
+			}
+			events := make([]*server.Event, 0, len(batch))
+			defer func() {
+				sendSyntheticEvents = false
+				result <- events
+				batch = make(map[string]entry)
+			}()
+			for _, p := range batch {
+				currEntry := p.currEntry
+				value, err := decode(currEntry)
+				if err != nil {
+					logrus.Warnf("watch event: could not decode %s seq %d", currEntry.Key(), currEntry.Revision())
+					return err
+				}
+				event := &server.Event{
+					Create: value.Create,
+					Delete: value.Delete,
+					KV:     value.KV,
+				}
+				prevEntry := p.prevEntry
+				if prevEntry != nil {
+					if v, err := decode(prevEntry); err != nil {
+						logrus.Warnf("watch event: could not decode %s seq %d", prevEntry.Key(), prevEntry.Revision())
+						return err
+					} else {
+						event.PrevKV = v.KV
+					}
+				} else {
+					if _, v, err := d.get(ctx, currEntry.Key(), value.PrevRevision, false); err != nil {
+						if err != nats.ErrKeyNotFound {
+							logrus.Warnf("watch event: could not get previous value for %s seq %d", currEntry.Key(), currEntry.Revision())
+							return err
 						}
-						prevValue := JSValue{
-							KV:           &server.KeyValue{},
-							PrevRevision: 0,
-							Create:       false,
-							Delete:       false,
-						}
-						lastEntry := &i
-
-						value, err = decode(*lastEntry)
-						if err != nil {
-							logrus.Warnf("watch event: could not decode %s seq %d", i.Key(), i.Revision())
-						}
-						if _, prevEntry, prevErr := d.get(ctx, i.Key(), value.PrevRevision, false); prevErr == nil {
-							if prevEntry != nil {
-								prevValue = *prevEntry
-							}
-						}
-						if err == nil {
-							event := &server.Event{
-								Create: value.Create,
-								Delete: value.Delete,
-								KV:     value.KV,
-								PrevKV: prevValue.KV,
-							}
-							events[0] = event
-							result <- events
-						} else {
-							logrus.Warnf("error decoding %s event %v", i.Key(), err)
-							continue
+					} else {
+						if v != nil {
+							event.PrevKV = v.KV
 						}
 					}
 				}
-			case <-ctx.Done():
-				logrus.Infof("watcher: %s context cancelled", prefix)
-				if err := watcher.Stop(); err != nil && err != nats.ErrBadSubscription {
-					logrus.Warnf("error stopping %s watcher: %v", prefix, err)
-				}
-				return
+				events = append(events, event)
 			}
+			return nil
+		}
+		addToBatch := func(e nats.KeyValueEntry) error {
+			if p, ok := batch[e.Key()]; ok {
+				if p.prevEntry != nil {
+					if err := flushBatch(); err != nil {
+						return err
+					}
+					batch[e.Key()] = p
+				}
+				p.prevEntry = p.currEntry
+				p.currEntry = e
+			} else {
+				batch[e.Key()] = entry{currEntry: e}
+			}
+			return nil
+		}
+		updates := watcher.Updates()
+		if ok, err := recvWhile(ctx, updates, func(e nats.KeyValueEntry) bool {
+			if e == nil {
+				if err := flushBatch(); err != nil {
+					return false
+				}
+				return true
+			}
+			// skip events before the requested revision.
+			if revision > 0 && int64(e.Revision()) < revision {
+				return true
+			}
+			if err := addToBatch(e); err != nil {
+				return false
+			}
+			if sendSyntheticEvents {
+				// don't flush batch until we've created all synthetic events.
+				return true
+			}
+			// batch buffered events.
+		batchLoop:
+			for {
+				select {
+				case e := <-updates:
+					if e == nil {
+						break batchLoop
+					}
+					if err := addToBatch(e); err != nil {
+						return false
+					}
+				default:
+					break batchLoop
+				}
+			}
+			if err := flushBatch(); err != nil {
+				return false
+			}
+			return true
+		}); err != nil {
+			logrus.Infof("watcher: %s context cancelled", prefix)
+			return
+		} else if !ok {
+			logrus.Warnf("watcher: %s channel closed", prefix)
+			return
 		}
 	}()
 	return result
