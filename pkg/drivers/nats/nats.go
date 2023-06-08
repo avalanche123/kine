@@ -805,7 +805,7 @@ func (d *Driver) Update(ctx context.Context, key string, value []byte, revision,
 		return 0, nil, false, err
 	}
 
-	seq, err := d.kv.Put(key, valueBytes)
+	seq, err := d.kv.Update(key, valueBytes, uint64(revision))
 	if err != nil {
 		return 0, nil, false, err
 	}
